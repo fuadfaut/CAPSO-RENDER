@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, font
 import os
 import threading
 from video_engine import VideoRenderer
@@ -59,8 +59,19 @@ class RenderApp:
         ttk.Label(frame_cap, text="Model Size:").grid(row=1, column=0, sticky="w")
         ttk.Combobox(frame_cap, textvariable=self.whisper_model, values=["tiny", "base", "small", "medium"], width=10).grid(row=1, column=1, sticky="w", padx=5)
         
+        # Get System Fonts
+        system_fonts = list(font.families())
+        system_fonts.sort()
+        
         ttk.Label(frame_cap, text="Font:").grid(row=2, column=0, sticky="w")
-        ttk.Entry(frame_cap, textvariable=self.font_name, width=15).grid(row=2, column=1, sticky="w", padx=5)
+        # Combobox for Font
+        font_cb = ttk.Combobox(frame_cap, textvariable=self.font_name, values=system_fonts, width=25, state="readonly")
+        font_cb.grid(row=2, column=1, sticky="w", padx=5)
+        # Set default if exists, else first available
+        if "Arial" in system_fonts:
+            font_cb.set("Arial")
+        elif system_fonts:
+            font_cb.current(0)
         
         ttk.Label(frame_cap, text="Size:").grid(row=2, column=2, sticky="w")
         ttk.Spinbox(frame_cap, from_=10, to=100, textvariable=self.font_size, width=5).grid(row=2, column=3, sticky="w")
