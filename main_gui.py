@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, font
 import os
 import threading
+import datetime
 from video_engine import VideoRenderer
 
 class RenderApp:
@@ -127,7 +128,11 @@ class RenderApp:
             renderer.caption_size = self.font_size.get()
             renderer.caption_pos = self.cap_pos.get()
             
-            out = "output_pro_test.mp4" if limit else "output_pro_full.mp4"
+            # Generate Timestamp Filename
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            mode = "test" if limit else "full"
+            out = f"render_{timestamp}_{mode}.mp4"
+            
             if renderer.generate_script(out, duration_limit=limit):
                 self.root.after(0, lambda: self._log(f"Done! File: {out}"))
                 self.root.after(0, lambda: messagebox.showinfo("Done", "Render Complete!"))
