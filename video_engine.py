@@ -20,9 +20,8 @@ class VideoRenderer:
         self.cam_shape = "rounded"
         self.cam_margin_x = 20
         self.cam_margin_y = 20
-        self.cam_position = "Top-Right" # New setting
+        self.cam_position = "Top-Right"
         
-        # Caption Settings
         self.enable_caption = False
         self.caption_font = "Arial"
         self.caption_size = 24
@@ -58,6 +57,13 @@ class VideoRenderer:
             return f"({v1:.2f}+{slope:.4f}*(t-{t1:.4f}))"
         mid = (start + end) // 2
         return f"if(lt(t,{times[mid]:.4f}),{self.build_lerp_tree(times, values, start, mid)},{self.build_lerp_tree(times, values, mid, end)})"
+
+    # Step function tree for Click Scale (instant change)
+    def build_step_tree(self, times, values, start, end):
+        if start == end:
+            return f"{values[start]:.2f}"
+        mid = (start + end) // 2
+        return f"if(lt(t,{times[mid]:.4f}),{self.build_step_tree(times, values, start, mid)},{self.build_step_tree(times, values, mid+1, end)})"
 
     def generate_captions(self, callback=None):
         def log(msg):
@@ -144,96 +150,119 @@ class VideoRenderer:
         with open(cursor_json_path, 'r') as f: data = json.load(f)
 
         moves = data.get('moves', [])
+        clicks = data.get('clicks', [])
+        
         if duration_limit: moves = [m for m in moves if m['time_ms']/1000.0 <= duration_limit + 1.0]
         if not moves: return False
+        
+        # Sort data
         moves.sort(key=lambda x: x['time_ms'])
-
+        
+        # Prepare Click Data
+        # We need to map clicks to a time series for scale factor
+        # Default scale = 1.0. If click down -> 0.85. If click up -> 1.0
+        # We will merge moves and clicks time points to create a continuous state
+        # But for efficiency, we can just use click events.
+        
+        log("Processing click animation...")
+        click_events = []
+        # Initial state
+        click_events.append({'time': 0.0, 'scale': 1.0})
+        
+        for c in clicks:
+            t = c['time_ms'] / 1000.0
+            if duration_limit and t > duration_limit + 1.0: continue
+            
+            s = 0.85 if c['down'] else 1.0
+            click_events.append({'time': t, 'scale': s})
+            
+        click_events.sort(key=lambda x: x['time'])
+        
+        # Build trees
         times = [m['time_ms'] / 1000.0 for m in moves]
         xs = [m['x'] * 1920 for m in moves]
         ys = [m['y'] * 1080 for m in moves]
         ids = [int(m['cursor_id']) for m in moves]
+        
+        c_times = [e['time'] for e in click_events]
+        c_scales = [e['scale'] for e in click_events]
 
-        log(f"Processing {len(moves)} cursor points...")
+        log(f"Building expressions ({len(moves)} moves, {len(click_events)} clicks)...")
         x_expr = self.build_lerp_tree(times, xs, 0, len(moves) - 1)
         y_expr = self.build_lerp_tree(times, ys, 0, len(moves) - 1)
         
-        def build_step_tree(vals, s, e):
+        # ID Tree logic (helper)
+        def build_id_tree(vals, s, e):
             if s == e: return str(vals[s])
             m = (s + e) // 2
-            return f"if(lt(t,{times[m]:.4f}),{build_step_tree(vals, s, m)},{build_step_tree(vals, m+1, e)})"
-        id_expr = build_step_tree(ids, 0, len(moves) - 1)
+            return f"if(lt(t,{times[m]:.4f}),{build_id_tree(vals, s, m)},{build_id_tree(vals, m+1, e)})"
+        id_expr = build_id_tree(ids, 0, len(moves) - 1)
+        
+        # Scale Tree logic (helper using click times)
+        def build_scale_tree(vals, s, e):
+            if s == e: return str(vals[s])
+            m = (s + e) // 2
+            return f"if(lt(t,{c_times[m]:.4f}),{build_scale_tree(vals, s, m)},{build_scale_tree(vals, m+1, e)})"
+        
+        if len(click_events) > 0:
+            scale_expr = build_scale_tree(c_scales, 0, len(click_events)-1)
+        else:
+            scale_expr = "1.0"
 
         inputs = ['-i', os.path.join(self.segment_dir, 'display.mp4'), '-i', os.path.join(self.segment_dir, 'camera.mp4'), '-i', os.path.join(self.segment_dir, 'audio-input.ogg')]
         for i in range(11): inputs.extend(['-i', os.path.join(self.cursor_dir, f'cursor_{i}.png')])
 
         filters = []
         
-        # --- 1. Camera Processing (Shadow & Shape) ---
-        # Scale & Shape
+        # --- 1. Camera Processing (Clean, No Shadow) ---
         filters.append(f"[1:v] scale={self.cam_scale_w}:{self.cam_scale_h}, format=rgba [cam_scaled];")
+        
         if self.cam_shape == "circle":
             r = min(self.cam_scale_w, self.cam_scale_h) / 2
-            filters.append(f"[cam_scaled] geq=lum='p(X,Y)':a='if(lte(pow(X-{self.cam_scale_w/2},2)+pow(Y-{self.cam_scale_h/2},2),{r*r}),255,0)' [cam_shape];")
+            filters.append(f"[cam_scaled] geq=lum='p(X,Y)':a='if(lte(pow(X-{self.cam_scale_w/2},2)+pow(Y-{self.cam_scale_h/2},2),{r*r}),255,0)' [cam_out];")
         elif self.cam_shape == "rounded":
             rad = 20
-            filters.append(f"[cam_scaled] geq=lum='p(X,Y)':a='if(lte(pow(max(0,abs(X-{self.cam_scale_w/2})-{self.cam_scale_w/2-rad}),2)+pow(max(0,abs(Y-{self.cam_scale_h/2})-{self.cam_scale_h/2-rad}),2),{rad*rad}),255,0)' [cam_shape];")
+            filters.append(f"[cam_scaled] geq=lum='p(X,Y)':a='if(lte(pow(max(0,abs(X-{self.cam_scale_w/2})-{self.cam_scale_w/2-rad}),2)+pow(max(0,abs(Y-{self.cam_scale_h/2})-{self.cam_scale_h/2-rad}),2),{rad*rad}),255,0)' [cam_out];")
         else:
-            filters.append("[cam_scaled] copy [cam_shape];")
+            filters.append("[cam_scaled] copy [cam_out];")
 
-        # Add Shadow to Camera
-        # Create a black box of same size, blur it, then overlay camera on top of it (with offset)
-        # To simplify, we'll extract alpha, color it black, blur, then offset.
-        # But for efficiency, we can assume a box shadow.
-        # Efficient Shadow: extract alpha, make it black, blur.
-        filters.append(f"[cam_shape] split [cam_fg][cam_bg];")
-        filters.append(f"[cam_bg] drawbox=c=black@0.4:t=fill, boxblur=10 [cam_shadow];")
-        # Shift shadow slightly (+4, +4) relative to camera.
-        # We'll handle this in the final overlay stage by overlaying shadow first.
-
-        # --- 2. Camera Overlay (Positioning) ---
+        # --- 2. Camera Overlay ---
         margin_x, margin_y = self.cam_margin_x, self.cam_margin_y
-        
-        # Calculate coordinates string
-        if "Top-Left" in self.cam_position:
-            cam_x, cam_y = f"{margin_x}", f"{margin_y}"
-        elif "Top-Right" in self.cam_position:
-            cam_x, cam_y = f"W-w-{margin_x}", f"{margin_y}"
-        elif "Bottom-Left" in self.cam_position:
-            cam_x, cam_y = f"{margin_x}", f"H-h-{margin_y}"
-        elif "Bottom-Right" in self.cam_position:
-            cam_x, cam_y = f"W-w-{margin_x}", f"H-h-{margin_y}"
-        elif "Top-Center" in self.cam_position:
-            cam_x, cam_y = f"(W-w)/2", f"{margin_y}"
-        elif "Bottom-Center" in self.cam_position:
-            cam_x, cam_y = f"(W-w)/2", f"H-h-{margin_y}"
-        else: # Default Top-Right
-            cam_x, cam_y = f"W-w-{margin_x}", f"{margin_y}"
+        if "Top-Left" in self.cam_position: cam_x, cam_y = f"{margin_x}", f"{margin_y}"
+        elif "Top-Right" in self.cam_position: cam_x, cam_y = f"W-w-{margin_x}", f"{margin_y}"
+        elif "Bottom-Left" in self.cam_position: cam_x, cam_y = f"{margin_x}", f"H-h-{margin_y}"
+        elif "Bottom-Right" in self.cam_position: cam_x, cam_y = f"W-w-{margin_x}", f"H-h-{margin_y}"
+        elif "Top-Center" in self.cam_position: cam_x, cam_y = f"(W-w)/2", f"{margin_y}"
+        elif "Bottom-Center" in self.cam_position: cam_x, cam_y = f"(W-w)/2", f"H-h-{margin_y}"
+        else: cam_x, cam_y = f"W-w-{margin_x}", f"{margin_y}"
 
-        # Overlay Shadow then Camera
-        # Shadow offset 5px
-        filters.append(f"[0:v][cam_shadow] overlay={cam_x}+5:{cam_y}+5 [bg_shadow];")
-        filters.append(f"[bg_shadow][cam_fg] overlay={cam_x}:{cam_y} [bg];")
+        filters.append(f"[0:v][cam_out] overlay={cam_x}:{cam_y} [bg];")
         
-        # --- 3. Cursor Processing (HD & Shadow) ---
+        # --- 3. Cursor Processing (Clean, Click Animation) ---
         c_size = self.cursor_scale
         cursor_pads = []
         for i in range(11):
-            # Use 'flags=lanczos' for better upscaling quality
-            # Add padding to hold the cursor + its shadow
-            pad_size = c_size + 10 # Extra space for shadow
-            filters.append(f"[{i+3}:v] scale={c_size}:{c_size}:force_original_aspect_ratio=decrease:flags=lanczos, split [c_fg{i}][c_bg{i}];")
-            
-            # Create shadow for cursor: fill black semi-transparent, blur
-            filters.append(f"[c_bg{i}] drawbox=c=black@0.3:t=fill, boxblur=3 [c_shadow{i}];")
-            
-            # Merge shadow and cursor into one layer (shadow offset +2,+2)
-            filters.append(f"[c_shadow{i}][c_fg{i}] overlay=x=2:y=2, pad={pad_size}:{pad_size}:0:0:color=black@0 [c_final{i}];")
-            
-            cursor_pads.append(f"[c_final{i}]")
+            # Scale only, no shadow.
+            filters.append(f"[{i+3}:v] scale={c_size}:{c_size}:force_original_aspect_ratio=decrease, pad={c_size}:{c_size}:(ow-iw)/2:(oh-ih)/2:color=black@0 [c{i}];")
+            cursor_pads.append(f"[c{i}]")
         
         filters.append(f"{''.join(cursor_pads)} vstack=inputs=11 [atlas];")
-        # Crop must now account for pad_size
-        filters.append(f"[atlas] crop={c_size+10}:{c_size+10}:0:'({id_expr})*({c_size+10})' [cursor];")
+        filters.append(f"[atlas] crop={c_size}:{c_size}:0:'({id_expr})*{c_size}' [cursor_raw];")
+        
+        # Apply Click Scale Animation
+        # We use 'scale' filter with eval=frame to dynamically resize the cursor based on time
+        # Note: Dynamic scaling in filter_complex can be heavy.
+        # Alternative: Scale the atlas or the cropped stream.
+        # Ideally: [cursor_raw] scale=w='iw*scale_expr':h='ih*scale_expr':eval=frame [cursor_scaled]
+        # But scale filter dynamic expression often requires w/h to be even numbers and can be tricky.
+        # Let's try simpler approach: we already have pads.
+        # Actually, simpler visual trick: We can't easily resize the stream constantly without re-padding.
+        # Let's Skip dynamic scaling in FFmpeg for now as it might break 'overlay' if dimensions change frame-by-frame without complex padding logic.
+        # Instead, we will simulate click by changing the 'overlay' expression? No overlay doesn't scale.
+        # Okay, let's try the 'scale' filter on the cropped cursor.
+        # We must pad it back to c_size to avoid overlay coordinate shifting errors.
+        
+        filters.append(f"[cursor_raw] scale=w='iw*({scale_expr})':h='ih*({scale_expr})':eval=frame, pad={c_size}:{c_size}:(ow-iw)/2:(oh-ih)/2:color=black@0:eval=frame [cursor];")
         
         filters.append(f"[bg][cursor] overlay=x='{x_expr}':y='{y_expr}':eval=frame{caption_filter} [outv];")
         
@@ -276,4 +305,4 @@ class VideoRenderer:
 
 if __name__ == "__main__":
     renderer = VideoRenderer(os.getcwd())
-    renderer.generate_script("output_smooth_test.mp4", duration_limit=60)
+    renderer.generate_script("output_click_test.mp4", duration_limit=60)
