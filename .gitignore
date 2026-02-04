@@ -1,0 +1,23 @@
+# Video & Large Media
+segments/
+cursors/
+*.mp4
+*.ogg
+*.png
+*.ass
+*.srt
+
+# FFmpeg temporary scripts
+filter_script*.txt
+sendcmd.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+venv/
+.venv/
+
+# AI Models
+whisper_models/
