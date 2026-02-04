@@ -9,7 +9,7 @@ class RenderApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Gemini Video Renderer Ultimate")
-        self.root.geometry("700x700")
+        self.root.geometry("700x750")
         
         # Variables
         self.project_dir = tk.StringVar()
@@ -55,29 +55,22 @@ class RenderApp:
         frame_cap.pack(fill="x", padx=10, pady=5)
 
         ttk.Checkbutton(frame_cap, text="Enable Auto Caption", variable=self.enable_caption).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(frame_cap, text="Use Faster-Whisper (Requires install)", variable=self.use_faster).grid(row=0, column=1, sticky="w")
+        ttk.Checkbutton(frame_cap, text="Use Faster-Whisper", variable=self.use_faster).grid(row=0, column=1, sticky="w")
         
-        ttk.Label(frame_cap, text="Model Size:").grid(row=1, column=0, sticky="w")
+        ttk.Label(frame_cap, text="Model:").grid(row=1, column=0, sticky="w")
         ttk.Combobox(frame_cap, textvariable=self.whisper_model, values=["tiny", "base", "small", "medium"], width=10).grid(row=1, column=1, sticky="w", padx=5)
         
-        # Get System Fonts
-        system_fonts = list(font.families())
-        system_fonts.sort()
-        
+        system_fonts = list(font.families()); system_fonts.sort()
         ttk.Label(frame_cap, text="Font:").grid(row=2, column=0, sticky="w")
-        # Combobox for Font
-        font_cb = ttk.Combobox(frame_cap, textvariable=self.font_name, values=system_fonts, width=25, state="readonly")
+        font_cb = ttk.Combobox(frame_cap, textvariable=self.font_name, values=system_fonts, width=20, state="readonly")
         font_cb.grid(row=2, column=1, sticky="w", padx=5)
-        # Set default if exists, else first available
-        if "Arial" in system_fonts:
-            font_cb.set("Arial")
-        elif system_fonts:
-            font_cb.current(0)
+        if "Arial" in system_fonts: font_cb.set("Arial")
+        elif system_fonts: font_cb.current(0)
         
         ttk.Label(frame_cap, text="Size:").grid(row=2, column=2, sticky="w")
         ttk.Spinbox(frame_cap, from_=10, to=100, textvariable=self.font_size, width=5).grid(row=2, column=3, sticky="w")
 
-        ttk.Label(frame_cap, text="Bottom Margin:").grid(row=3, column=0, sticky="w")
+        ttk.Label(frame_cap, text="Pos (Y):").grid(row=3, column=0, sticky="w")
         ttk.Scale(frame_cap, from_=10, to=500, variable=self.cap_pos, orient="horizontal", command=lambda v: self.cap_pos.set(int(float(v)))).grid(row=3, column=1, sticky="ew", padx=5)
         ttk.Label(frame_cap, textvariable=self.cap_pos).grid(row=3, column=2, sticky="w")
 
@@ -89,15 +82,33 @@ class RenderApp:
         self.btn_test = ttk.Button(frame_actions, text="Test Render (1 min)", command=lambda: self._start_render(limit=60))
         self.btn_test.pack(fill="x")
 
-        # 5. Log
-        self.log_area = tk.Text(self.root, height=10, state="disabled")
+        # 5. Log Control
+        frame_log_ctrl = ttk.Frame(self.root)
+        frame_log_ctrl.pack(fill="x", padx=20, pady=(10,0))
+        ttk.Label(frame_log_ctrl, text="Process Log:").pack(side="left")
+        ttk.Button(frame_log_ctrl, text="Save Log", command=self._save_log).pack(side="right", padx=5)
+        ttk.Button(frame_log_ctrl, text="Copy Log", command=self._copy_log).pack(side="right")
+
+        # 6. Log Area
+        self.log_area = tk.Text(self.root, height=12, state="normal") # Keep normal to allow selection
         self.log_area.pack(fill="both", expand=True, padx=10, pady=5)
+        self.log_area.bind("<Key>", lambda e: "break") # Disable typing but allow selection/copy
 
     def _log(self, msg):
-        self.log_area.config(state="normal")
-        self.log_area.insert("end", msg + "\n")
+        # Update GUI from thread
+        self.log_area.insert("end", msg.strip() + "\n")
         self.log_area.see("end")
-        self.log_area.config(state="disabled")
+
+    def _copy_log(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.log_area.get("1.0", "end"))
+        messagebox.showinfo("Info", "Log copied to clipboard!")
+
+    def _save_log(self):
+        f = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text Files", "*.txt")])
+        if f:
+            with open(f, "w") as file:
+                file.write(self.log_area.get("1.0", "end"))
 
     def _browse_dir(self):
         d = filedialog.askdirectory()
@@ -109,9 +120,11 @@ class RenderApp:
         if not p_dir or not os.path.exists(p_dir):
             messagebox.showerror("Error", "Select a valid project directory.")
             return
+
         self.is_rendering = True
         self.btn_render.config(state="disabled"); self.btn_test.config(state="disabled")
-        self._log("Engine started...")
+        self.log_area.delete("1.0", "end") # Clear previous log
+        self._log("Starting engine...")
         threading.Thread(target=self._render_task, args=(limit,), daemon=True).start()
 
     def _render_task(self, limit):
@@ -128,18 +141,24 @@ class RenderApp:
             renderer.caption_size = self.font_size.get()
             renderer.caption_pos = self.cap_pos.get()
             
-            # Generate Timestamp Filename
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             mode = "test" if limit else "full"
             out = f"render_{timestamp}_{mode}.mp4"
             
-            if renderer.generate_script(out, duration_limit=limit):
-                self.root.after(0, lambda: self._log(f"Done! File: {out}"))
-                self.root.after(0, lambda: messagebox.showinfo("Done", "Render Complete!"))
+            # Thread-safe log callback
+            def log_callback(msg):
+                self.root.after(0, lambda: self._log(msg))
+
+            success = renderer.generate_script(out, duration_limit=limit, callback=log_callback)
+            
+            if success:
+                self.root.after(0, lambda: messagebox.showinfo("Done", f"Render Complete!\nSaved to: {out}"))
             else:
-                self.root.after(0, lambda: self._log("Render failed. Check terminal."))
+                self.root.after(0, lambda: self._log("\n[ERROR] Render failed. See log above."))
+                self.root.after(0, lambda: messagebox.showerror("Error", "Render Failed. Check log."))
         except Exception as e:
-            self.root.after(0, lambda: self._log(f"Error: {e}"))
+            err_msg = str(e)
+            self.root.after(0, lambda: self._log(f"\n[CRITICAL ERROR] {err_msg}"))
         finally:
             self.is_rendering = False
             self.root.after(0, lambda: self.btn_render.config(state="normal"))
